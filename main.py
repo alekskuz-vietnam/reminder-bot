@@ -6,13 +6,11 @@ from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters, CommandHandler, ConversationHandler
+    ContextTypes, filters, CommandHandler
 )
 
 logging.basicConfig(level=logging.INFO)
 TIMEZONE = pytz.timezone("Europe/Moscow")
-
-WAITING_RESCHEDULE = 1
 
 MONTHS_RU = {
     'января':1,'февраля':2,'марта':3,'апреля':4,'мая':5,'июня':6,
@@ -23,6 +21,7 @@ WEEKDAYS_RU = {
     'четверг':3,'пятница':4,'пятницу':4,'пятници':4,
     'суббота':5,'субботу':5,'воскресенье':6,'воскресенья':6
 }
+WEEKDAYS_NAMES = ['понедельник','вторник','среда','четверг','пятница','суббота','воскресенье']
 
 def now():
     return datetime.now(TIMEZONE)
@@ -53,7 +52,6 @@ def parse_datetime(text):
     text = text.strip()
     t = now()
 
-    # Ежемесячное
     m = re.match(r'^каждо[ей]\s+(\d{1,2})\s+числ[ао]\s+месяца\s+(\S+)(.*)', text, re.IGNORECASE)
     if m:
         day = int(m.group(1))
@@ -68,7 +66,6 @@ def parse_datetime(text):
                 target = target.replace(year=year, month=month)
             return target, reminder or "Ежемесячное напоминание", True, None
 
-    # ДД.ММ.ГГГГ или ДД.ММ
     m = re.match(r'^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\s*(\S*)?(.*)', text)
     if m:
         day, month = int(m.group(1)), int(m.group(2))
@@ -85,7 +82,6 @@ def parse_datetime(text):
         except ValueError:
             pass
 
-    # Число + русский месяц
     pattern_date = r'^(\d{1,2})\s+(' + '|'.join(MONTHS_RU.keys()) + r')(?:\s+(\d{4}))?\s*(\S*)?(.*)'
     m = re.match(pattern_date, text, re.IGNORECASE)
     if m:
@@ -104,7 +100,6 @@ def parse_datetime(text):
         except ValueError:
             pass
 
-    # День недели
     pattern_wd = r'^(' + '|'.join(WEEKDAYS_RU.keys()) + r')\s*(\S*)?(.*)'
     m = re.match(pattern_wd, text, re.IGNORECASE)
     if m:
@@ -116,7 +111,6 @@ def parse_datetime(text):
         target = apply_time(next_weekday(wd), h, mn)
         return target, reminder or text, False, None
 
-    # Завтра
     m = re.match(r'^завтра\s*(\S*)?(.*)', text, re.IGNORECASE)
     if m:
         time_str = m.group(1) or ''
@@ -126,7 +120,6 @@ def parse_datetime(text):
         target = apply_time(t + timedelta(days=1), h, mn)
         return target, reminder or "Напоминание", False, None
 
-    # Относительное: 30m / 2h
     m = re.match(r'^(\d+)(m|h|ч|мин)\s*(.*)', text, re.IGNORECASE)
     if m:
         val = int(m.group(1))
@@ -135,7 +128,6 @@ def parse_datetime(text):
         delta = timedelta(hours=val) if unit in ('h','ч') else timedelta(minutes=val)
         return t + delta, reminder or "Напоминание", False, None
 
-    # Просто время: 16:00 текст или 16 текст
     m = re.match(r'^(\d{1,2}(?::\d{2})?)\s+(.*)', text)
     if m:
         time_parts = parse_time_str(m.group(1))
@@ -147,15 +139,137 @@ def parse_datetime(text):
                 target += timedelta(days=1)
             return target, reminder, False, None
 
-    return None, None, False, "Не понял формат. Примеры:\n<b>16:00 Текст\n30m Текст\nзавтра 10:00 Текст\nпонедельник 10:00 Текст\n4 апреля 10:00 Текст\n23.10 10:00 Текст</b>"
+    return None, None, False, (
+        "Не понял формат. Примеры:\n"
+        "<b>16:00 Текст\n30m Текст\nзавтра 10:00 Текст\n"
+        "понедельник 10:00 Текст\n4 апреля 10:00 Текст\n"
+        "23.10 10:00 Текст\nкаждое 1 число месяца 10:00 Текст</b>"
+    )
+
+def get_user_jobs(context, chat_id):
+    return sorted(
+        [j for j in context.job_queue.jobs() if j.chat_id == chat_id and j.data],
+        key=lambda j: j.next_t
+    )
+
+def format_job(j, idx):
+    data = j.data
+    fire_dt = j.next_t.astimezone(TIMEZONE)
+    wd = WEEKDAYS_NAMES[fire_dt.weekday()]
+    date_str = fire_dt.strftime(f"%-d %B %Y г. (в {wd}) в %H:%M")
+    lines = [f"{idx}) ⌚ {date_str}"]
+    if data.get("repeat_monthly"):
+        day = data.get("original_day", "?")
+        h = data.get("original_hour", 10)
+        mn = data.get("original_minute", 0)
+        lines.append(f"∞ каждое {day}-е число месяца в {h:02d}:{mn:02d}")
+    lines.append(f"〰️ {data['text']}")
+    return "\n".join(lines)
+
+def list_keyboard(page, total_pages, show_delete=False, jobs_on_page=0):
+    rows = []
+    if not show_delete:
+        nav = []
+        if total_pages > 1:
+            nav.append(InlineKeyboardButton(">", callback_data=f"list_next_{page}"))
+            nav.append(InlineKeyboardButton(">>", callback_data=f"list_last_{total_pages-1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton("✖️ Удалить по номеру", callback_data=f"list_delete_mode_{page}")])
+    else:
+        # Сетка номеров
+        nums = list(range(1, jobs_on_page + 1))
+        row = []
+        for n in nums:
+            row.append(InlineKeyboardButton(str(n), callback_data=f"list_del_{page}_{n-1}"))
+            if len(row) == 5:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("« Назад", callback_data=f"list_page_{page}")])
+    return InlineKeyboardMarkup(rows)
+
+def build_list_text(jobs, page):
+    per_page = 10
+    start = page * per_page
+    chunk = jobs[start:start+per_page]
+    if not chunk:
+        return "Нет активных напоминаний.", []
+    lines = ["⚡ <b>Активные напоминания</b>\n"]
+    for i, j in enumerate(chunk):
+        lines.append(format_job(j, start + i + 1))
+    return "\n".join(lines), chunk
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    jobs = get_user_jobs(context, chat_id)
+    if not jobs:
+        await update.message.reply_text("Нет активных напоминаний.")
+        return
+    per_page = 10
+    total_pages = max(1, (len(jobs) + per_page - 1) // per_page)
+    text, chunk = build_list_text(jobs, 0)
+    kb = list_keyboard(0, total_pages, show_delete=False, jobs_on_page=len(chunk))
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+async def list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    data = query.data
+    jobs = get_user_jobs(context, chat_id)
+    per_page = 10
+    total_pages = max(1, (len(jobs) + per_page - 1) // per_page)
+
+    if data.startswith("list_page_"):
+        page = int(data.split("_")[-1])
+        text, chunk = build_list_text(jobs, page)
+        kb = list_keyboard(page, total_pages, show_delete=False, jobs_on_page=len(chunk))
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+
+    elif data.startswith("list_next_"):
+        page = int(data.split("_")[-1])
+        next_page = min(page + 1, total_pages - 1)
+        text, chunk = build_list_text(jobs, next_page)
+        kb = list_keyboard(next_page, total_pages, show_delete=False, jobs_on_page=len(chunk))
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+
+    elif data.startswith("list_last_"):
+        page = int(data.split("_")[-1])
+        text, chunk = build_list_text(jobs, page)
+        kb = list_keyboard(page, total_pages, show_delete=False, jobs_on_page=len(chunk))
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+
+    elif data.startswith("list_delete_mode_"):
+        page = int(data.split("_")[-1])
+        text, chunk = build_list_text(jobs, page)
+        kb = list_keyboard(page, total_pages, show_delete=True, jobs_on_page=len(chunk))
+        await query.edit_message_reply_markup(reply_markup=kb)
+
+    elif data.startswith("list_del_"):
+        parts = data.split("_")
+        page = int(parts[2])
+        idx_on_page = int(parts[3])
+        start = page * per_page
+        target_idx = start + idx_on_page
+        if target_idx < len(jobs):
+            jobs[target_idx].schedule_removal()
+        jobs = get_user_jobs(context, chat_id)
+        total_pages = max(1, (len(jobs) + per_page - 1) // per_page)
+        page = min(page, total_pages - 1)
+        if not jobs:
+            await query.edit_message_text("Нет активных напоминаний.")
+            return
+        text, chunk = build_list_text(jobs, page)
+        kb = list_keyboard(page, total_pages, show_delete=False, jobs_on_page=len(chunk))
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
 
 def creation_keyboard(job_name):
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🕐 Изменить", callback_data=f"edit_{job_name}"),
-            InlineKeyboardButton("✖️ Отменить", callback_data=f"cancel_{job_name}"),
-        ]
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🕐 Изменить", callback_data=f"edit_{job_name}"),
+        InlineKeyboardButton("✖️ Отменить", callback_data=f"cancel_{job_name}"),
+    ]])
 
 def reminder_keyboard(job_name):
     return InlineKeyboardMarkup([
@@ -174,7 +288,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     chat_id = update.effective_chat.id
 
-    # Если ждём время для переноса
     if context.user_data.get("waiting_reschedule"):
         await handle_reschedule_input(update, context)
         return
@@ -186,7 +299,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     delay = max(0, (fire_dt - now()).total_seconds())
     job_name = f"{chat_id}_{int(fire_dt.timestamp())}"
-    fire_str = fire_dt.strftime("%-d %B %Y г. (в %A) в %H:%M")
+    wd = WEEKDAYS_NAMES[fire_dt.weekday()]
+    fire_str = fire_dt.strftime(f"%-d %B %Y г. (в {wd}) в %H:%M")
 
     job_data = {
         "text": reminder_text,
@@ -204,9 +318,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        f"☑️ Напоминание запланировано.\n\n"
-        f"⌚️ <b>{fire_str}</b>\n"
-        f"〰️ {reminder_text}",
+        f"☑️ Напоминание запланировано.\n\n⌚️ <b>{fire_str}</b>\n〰️ {reminder_text}",
         parse_mode="HTML",
         reply_markup=creation_keyboard(job_name)
     )
@@ -214,16 +326,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     chat_id = data["chat_id"]
-    text = data["text"]
     job_name = context.job.name
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"❕ {text}",
+        text=f"❕ {data['text']}",
         reply_markup=reminder_keyboard(job_name)
     )
 
-    # Повтор через 15 минут
     if data.get("repeat_monthly"):
         n = now()
         month = n.month + 1 if n.month < 12 else 1
@@ -231,8 +341,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         try:
             next_dt = TIMEZONE.localize(datetime(year, month, data["original_day"],
                                                   data["original_hour"], data["original_minute"]))
-            delay = (next_dt - now()).total_seconds()
-            context.job_queue.run_once(send_reminder, when=delay,
+            context.job_queue.run_once(send_reminder, when=(next_dt - now()).total_seconds(),
                                        chat_id=chat_id, name=job_name, data=data)
         except Exception:
             pass
@@ -245,7 +354,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     raw = query.data
 
-    # Отмена при создании
+    if raw.startswith("list_"):
+        await list_callback(update, context)
+        return
+
     if raw.startswith("cancel_"):
         job_name = raw[len("cancel_"):]
         for job in context.job_queue.get_jobs_by_name(job_name):
@@ -253,28 +365,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✖️ Напоминание отменено.")
         return
 
-    # Изменить время при создании
     if raw.startswith("edit_"):
         job_name = raw[len("edit_"):]
         context.user_data["waiting_reschedule"] = job_name
-        context.user_data["reschedule_msg_id"] = query.message.message_id
+        context.user_data["reschedule_text"] = query.message.text.split("〰️")[-1].strip() if "〰️" in query.message.text else "Напоминание"
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("⌚️ Напиши новое время (например: <b>18:00</b> или <b>завтра 10:00</b>)", parse_mode="HTML")
         return
 
-    # Готово
     if raw.startswith("done_"):
         job_name = raw[len("done_"):]
         for job in context.job_queue.get_jobs_by_name(job_name):
             job.schedule_removal()
         try:
-            new_text = query.message.text.replace("❕", "✔️")
-            await query.edit_message_text(text=new_text)
+            await query.edit_message_text(query.message.text.replace("❕", "✔️"))
         except Exception:
             await query.edit_message_reply_markup(reply_markup=None)
         return
 
-    # Перенос: 1h / 3h / 1d
     for prefix, delta in [("snooze_1h_", timedelta(hours=1)),
                            ("snooze_3h_", timedelta(hours=3)),
                            ("snooze_1d_", timedelta(days=1))]:
@@ -282,34 +390,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             job_name = raw[len(prefix):]
             for job in context.job_queue.get_jobs_by_name(job_name):
                 job.schedule_removal()
-            old_data = None
-            # Достаём данные из старого job если ещё живой, иначе из текста сообщения
             reminder_text = query.message.text.replace("❕ ", "").strip()
-            old_data = {
-                "text": reminder_text,
-                "repeat": True,
-                "repeat_monthly": False,
-                "chat_id": query.message.chat_id,
-            }
             fire_dt = now() + delta
             new_job_name = f"{query.message.chat_id}_{int(fire_dt.timestamp())}"
-            fire_str = fire_dt.strftime("%-d %B %Y г. в %H:%M")
+            wd = WEEKDAYS_NAMES[fire_dt.weekday()]
+            fire_str = fire_dt.strftime(f"%-d %B %Y г. (в {wd}) в %H:%M")
+            job_data = {"text": reminder_text, "repeat": True, "repeat_monthly": False, "chat_id": query.message.chat_id}
             context.job_queue.run_once(send_reminder, when=delta.total_seconds(),
-                                       chat_id=query.message.chat_id,
-                                       name=new_job_name, data=old_data)
-            await query.edit_message_text(
-                f"⏰ Перенесено на <b>{fire_str}</b>\n〰️ {reminder_text}",
-                parse_mode="HTML"
-            )
+                                       chat_id=query.message.chat_id, name=new_job_name, data=job_data)
+            await query.edit_message_text(f"⏰ Перенесено на <b>{fire_str}</b>\n〰️ {reminder_text}", parse_mode="HTML")
             return
 
-    # Перенос: свой вариант "..."
     if raw.startswith("snooze_custom_"):
         job_name = raw[len("snooze_custom_"):]
         reminder_text = query.message.text.replace("❕ ", "").strip()
         context.user_data["waiting_reschedule"] = job_name
         context.user_data["reschedule_text"] = reminder_text
-        context.user_data["reschedule_msg_id"] = query.message.message_id
+        for job in context.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text("⌚️ Напиши новое время (например: <b>18:00</b> или <b>завтра 10:00</b>)", parse_mode="HTML")
         return
@@ -318,48 +416,39 @@ async def handle_reschedule_input(update: Update, context: ContextTypes.DEFAULT_
     text = update.message.text.strip()
     job_name = context.user_data.get("waiting_reschedule")
     reminder_text = context.user_data.get("reschedule_text", "Напоминание")
+    chat_id = update.effective_chat.id
 
-    # Останавливаем старый job
     for job in context.job_queue.get_jobs_by_name(job_name):
         job.schedule_removal()
 
-    # Парсим только время из ввода (без текста)
-    fire_dt, _, _, err = parse_datetime(text + " x")  # добавляем x как placeholder текста
-    if err or not fire_dt:
-        # Попробуем как чистое время
-        tp = parse_time_str(text)
-        if tp:
-            h, mn = tp
-            fire_dt = apply_time(now(), h, mn)
-            if fire_dt <= now():
-                fire_dt += timedelta(days=1)
-        else:
+    tp = parse_time_str(text)
+    if tp:
+        h, mn = tp
+        fire_dt = apply_time(now(), h, mn)
+        if fire_dt <= now():
+            fire_dt += timedelta(days=1)
+    else:
+        fire_dt, _, _, err = parse_datetime(text + " x")
+        if err or not fire_dt:
             await update.message.reply_text("Не понял время. Напиши например: <b>18:00</b> или <b>завтра 10:00</b>", parse_mode="HTML")
             return
 
     context.user_data.pop("waiting_reschedule", None)
     context.user_data.pop("reschedule_text", None)
-    context.user_data.pop("reschedule_msg_id", None)
 
     delay = max(0, (fire_dt - now()).total_seconds())
-    new_job_name = f"{update.effective_chat.id}_{int(fire_dt.timestamp())}"
-    fire_str = fire_dt.strftime("%-d %B %Y г. в %H:%M")
+    new_job_name = f"{chat_id}_{int(fire_dt.timestamp())}"
+    wd = WEEKDAYS_NAMES[fire_dt.weekday()]
+    fire_str = fire_dt.strftime(f"%-d %B %Y г. (в {wd}) в %H:%M")
 
-    job_data = {
-        "text": reminder_text,
-        "repeat": True,
-        "repeat_monthly": False,
-        "chat_id": update.effective_chat.id,
-    }
-
-    context.job_queue.run_once(send_reminder, when=delay,
-                               chat_id=update.effective_chat.id,
-                               name=new_job_name, data=job_data)
-
+    context.job_queue.run_once(send_reminder, when=delay, chat_id=chat_id,
+                               name=new_job_name, data={
+                                   "text": reminder_text, "repeat": True,
+                                   "repeat_monthly": False, "chat_id": chat_id
+                               })
     await update.message.reply_text(
         f"☑️ Перенесено.\n\n⌚️ <b>{fire_str}</b>\n〰️ {reminder_text}",
-        parse_mode="HTML",
-        reply_markup=creation_keyboard(new_job_name)
+        parse_mode="HTML", reply_markup=creation_keyboard(new_job_name)
     )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -372,32 +461,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>4 апреля 10:00 Продлить страховку</b>\n"
         "<b>23.10 10:00 Оплатить аренду</b>\n"
         "<b>каждое 1 число месяца 10:00 Отчёт</b>\n\n"
-        "Буду напоминать каждые 15 минут пока не нажмёшь ✅",
+        "Буду напоминать каждые 15 минут пока не нажмёшь ✅\n\n"
+        "/list — список напоминаний",
         parse_mode="HTML"
     )
 
-async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    all_jobs = context.job_queue.jobs()
-    my_jobs = [j for j in all_jobs if j.chat_id == chat_id and j.data]
-    if not my_jobs:
-        await update.message.reply_text("Нет активных напоминаний.")
-        return
-    lines = []
-    n = now()
-    for j in my_jobs:
-        try:
-            secs = int(j.next_t.timestamp() - n.timestamp())
-            mins = max(0, secs // 60)
-            lines.append(f"❕ {j.data['text']} — через {mins} мин.")
-        except Exception:
-            pass
-    await update.message.reply_text("\n".join(lines) if lines else "Нет активных напоминаний.")
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Форматы напоминаний:\n\n"
+        "<b>16:00 Текст</b> — сегодня в 16:00\n"
+        "<b>30m Текст</b> — через 30 минут\n"
+        "<b>2h Текст</b> — через 2 часа\n"
+        "<b>завтра 10:00 Текст</b>\n"
+        "<b>понедельник 10:00 Текст</b>\n"
+        "<b>4 апреля 10:00 Текст</b>\n"
+        "<b>23.10 10:00 Текст</b>\n"
+        "<b>каждое 1 число месяца 10:00 Текст</b>\n\n"
+        "Команды:\n"
+        "/list — список активных напоминаний\n"
+        "/help — эта справка",
+        parse_mode="HTML"
+    )
+
+async def getid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Ваш chat ID: <code>{update.effective_chat.id}</code>", parse_mode="HTML")
 
 def main():
     token = os.environ["BOT_TOKEN"]
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("getid", getid_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
