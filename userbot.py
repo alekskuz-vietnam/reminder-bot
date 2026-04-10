@@ -167,4 +167,108 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         )
 
-    elif data.startswith
+    elif data.startswith("delkw_"):
+        kw = data[6:]
+        if kw in STATE["keywords"]:
+            STATE["keywords"].remove(kw)
+        kw_list = "\n".join(f"• {k}" for k in STATE["keywords"]) or "Нет слов"
+        await query.edit_message_text(
+            f"✅ Слово «{kw}» удалено.\n\n🔍 Слова:\n{kw_list}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Добавить слово", callback_data="add_keyword")],
+                [InlineKeyboardButton("➖ Удалить слово", callback_data="del_keyword_list")],
+                [InlineKeyboardButton("« Назад", callback_data="back_main")],
+            ])
+        )
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != MY_CHAT_ID:
+        return
+    waiting = context.user_data.get("waiting")
+    if not waiting:
+        return
+    text = update.message.text.strip().lstrip("@")
+    context.user_data.pop("waiting")
+
+    if waiting == "add_channel":
+        if text not in STATE["channels"]:
+            STATE["channels"].append(text)
+            await update_userbot_channels()
+        channels_list = "\n".join(f"• @{c}" for c in STATE["channels"])
+        await update.message.reply_text(
+            f"✅ Канал @{text} добавлен.\n\n📡 Каналы:\n{channels_list}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Добавить канал", callback_data="add_channel")],
+                [InlineKeyboardButton("➖ Удалить канал", callback_data="del_channel_list")],
+                [InlineKeyboardButton("« Назад", callback_data="back_main")],
+            ])
+        )
+
+    elif waiting == "add_keyword":
+        if text not in STATE["keywords"]:
+            STATE["keywords"].append(text)
+        kw_list = "\n".join(f"• {k}" for k in STATE["keywords"])
+        await update.message.reply_text(
+            f"✅ Слово «{text}» добавлено.\n\n🔍 Слова:\n{kw_list}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Добавить слово", callback_data="add_keyword")],
+                [InlineKeyboardButton("➖ Удалить слово", callback_data="del_keyword_list")],
+                [InlineKeyboardButton("« Назад", callback_data="back_main")],
+            ])
+        )
+
+# ===== USERBOT (мониторинг) =====
+
+async def update_userbot_channels():
+    """Перезапускает обработчик с новым списком каналов"""
+    user_client.remove_event_handler(channel_handler)
+    if STATE["channels"]:
+        user_client.add_event_handler(
+            channel_handler,
+            events.NewMessage(chats=STATE["channels"])
+        )
+
+async def channel_handler(event):
+    if not STATE["active"]:
+        return
+    text = event.message.text or ""
+    text_lower = text.lower()
+    found = [kw for kw in STATE["keywords"] if kw.lower() in text_lower]
+    if not found:
+        return
+    keywords_str = ", ".join(found)
+    forward_text = (
+        f"🔍 Канал: {event.chat.title}\n"
+        f"🏷 Слова: {keywords_str}\n\n"
+        f"{text[:1000]}"
+    )
+    await user_client.send_message(MY_CHAT_ID, forward_text)
+
+# ===== MAIN =====
+
+async def main():
+    await user_client.start()
+    user_client.add_event_handler(
+        channel_handler,
+        events.NewMessage(chats=STATE["channels"])
+    )
+    print("Userbot запущен, слежу за каналами...")
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("setup", cmd_setup))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+
+    await user_client.run_until_disconnected()
+
+    await app.updater.stop()
+    await app.stop()
+    await app.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
